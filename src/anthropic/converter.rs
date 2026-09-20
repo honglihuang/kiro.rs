@@ -375,7 +375,11 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                // tool_result 内容中可能夹带 image 块（例如读取图片文件的工具），
+                                // 需一并提取，否则图片会被静默丢弃
+                                let (result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
+                                images.extend(result_images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -415,21 +419,48 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
+///
+/// 返回 (文本内容, 图片列表)。
+///
+/// tool_result 的 content 数组里除 text 块外，还可能包含 image 块——
+/// 例如读取图片文件、渲染 PDF 页、浏览器截图这类工具的返回。Kiro 的
+/// ToolResult 结构只承载文本，故此处把 image 块单独提出来，由调用方
+/// 合并进 UserInputMessage.images 一起上送，避免图片被静默丢弃。
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+) -> (String, Vec<KiroImage>) {
+    let mut images = Vec::new();
+    let text = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                    continue;
+                }
+                // 形如 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+                if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    if let Some(source) = item.get("source") {
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let data = source.get("data").and_then(|v| v.as_str());
+                        if let (Some(format), Some(data)) =
+                            (get_image_format(media_type), data)
+                        {
+                            images.push(KiroImage::from_base64(format, data));
+                        }
+                    }
                 }
             }
             parts.join("\n")
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+    (text, images)
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
