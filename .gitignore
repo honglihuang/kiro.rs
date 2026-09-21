@@ -11,3 +11,7 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/sync_credentials.ps1
+/_读图修复说明.md
+/_重编译读图修复.bat
+/一键配置并启动Kiro代理.bat
