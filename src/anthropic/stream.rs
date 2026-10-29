@@ -3,6 +3,7 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde_json::json;
 use uuid::Uuid;
@@ -544,6 +545,9 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// [fork 定制] 耗时测量：上下文创建时刻（约等于上游请求发出时刻）、首个上游事件时刻
+    timing_start: Instant,
+    timing_first_event: Option<Instant>,
 }
 
 impl StreamContext {
@@ -571,7 +575,14 @@ impl StreamContext {
             text_block_index: None,
             unknown_event_counts: HashMap::new(),
             strip_thinking_leading_newline: false,
+            timing_start: Instant::now(),
+            timing_first_event: None,
         }
+    }
+
+    /// [fork 定制] 把计时起点对齐到上游请求发出前，而不是上下文创建时
+    pub fn set_timing_start(&mut self, start: Instant) {
+        self.timing_start = start;
     }
 
     /// 记录一个未识别的上游事件类型
@@ -673,6 +684,9 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.timing_first_event.is_none() {
+            self.timing_first_event = Some(Instant::now());
+        }
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -1161,6 +1175,25 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
+        // [fork 定制] 单轮耗时与真实上下文统计，用于定位每轮时间花在哪
+        // ttfb = 请求发出到收到首个上游事件（≈ 网络 + 上游 Prefill）
+        // total = 请求发出到上游流结束；decode = total - ttfb
+        let total_ms = self.timing_start.elapsed().as_millis();
+        let ttfb_ms = self
+            .timing_first_event
+            .map(|t| t.duration_since(self.timing_start).as_millis());
+        tracing::info!(
+            model = %self.model,
+            ttfb_ms = ?ttfb_ms,
+            total_ms,
+            decode_ms = ?ttfb_ms.map(|t| total_ms.saturating_sub(t)),
+            actual_input_tokens = ?self.context_input_tokens,
+            est_input_tokens = self.input_tokens,
+            output_tokens = self.output_tokens,
+            stop_reason = %self.state_manager.get_stop_reason(),
+            "上游请求完成"
+        );
+
         // 生成最终事件
         events.extend(
             self.state_manager
@@ -1207,6 +1240,11 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    /// [fork 定制] 见 StreamContext::set_timing_start
+    pub fn set_timing_start(&mut self, start: Instant) {
+        self.inner.set_timing_start(start);
     }
 
     /// 处理 Kiro 事件并缓冲结果

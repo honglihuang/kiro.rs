@@ -15,3 +15,6 @@
 /_读图修复说明.md
 /_重编译读图修复.bat
 /一键配置并启动Kiro代理.bat
+/一键配置并启动Kiro代理.bat.bak
+/kiro-proxy*.log
+/target-verify/

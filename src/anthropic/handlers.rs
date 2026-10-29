@@ -405,6 +405,9 @@ pub async fn post_messages(
         payload.tools,
     ) as i32;
 
+    // [fork 定制] 打印实际发往 Kiro 的模型 ID 与请求统计
+    log_upstream_request(&kiro_request, &payload.model, &request_body, input_tokens);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -442,6 +445,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let upstream_start = std::time::Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
@@ -449,6 +453,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_timing_start(upstream_start);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -832,6 +837,30 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+/// [fork 定制] 打印实际发往 Kiro 的模型 ID 与请求统计，不含任何消息内容
+fn log_upstream_request(
+    kiro_request: &KiroRequest,
+    client_model: &str,
+    request_body: &str,
+    input_tokens: i32,
+) {
+    let state = &kiro_request.conversation_state;
+    let current = &state.current_message.user_input_message;
+    let tools = &current.user_input_message_context.tools;
+    let tools_bytes = serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0);
+    tracing::info!(
+        upstream_model = %current.model_id,
+        client_model = %client_model,
+        history = state.history.len(),
+        tools = tools.len(),
+        tools_bytes,
+        images = current.images.len(),
+        body_bytes = request_body.len(),
+        est_input_tokens = input_tokens,
+        "发往 Kiro 的请求"
+    );
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
@@ -1003,6 +1032,9 @@ pub async fn post_messages_cc(
         payload.tools,
     ) as i32;
 
+    // [fork 定制] 打印实际发往 Kiro 的模型 ID 与请求统计
+    log_upstream_request(&kiro_request, &payload.model, &request_body, input_tokens);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1043,13 +1075,20 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let upstream_start = std::time::Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
+    ctx.set_timing_start(upstream_start);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

@@ -85,35 +85,13 @@ pub fn map_model(model: &str) -> Option<String> {
         // 目前 Kiro 仅上线 5.1 一个 Fable 版本，故与 haiku 分支一致采用无条件映射
         Some("claude-fable-5.1".to_string())
     } else if model_lower.contains("sonnet") {
-        // 5.5 必须先于 sonnet-5 判断：`contains("sonnet-5")` 会同时匹配 sonnet-5.5
-        if model_lower.contains("sonnet-5-5") || model_lower.contains("sonnet-5.5") {
-            Some("claude-sonnet-5.5".to_string())
-        } else if model_lower.contains("sonnet-5") {
-            Some("claude-sonnet-5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
+        // [fork 定制] sonnet 全族无条件用最新版，忽略请求里的版本号（不提给上游）
+        // 实测 Kiro 侧为点号形式 claude-sonnet-5.5（claude-sonnet-5-5 被上游拒绝）
+        Some("claude-sonnet-5.5".to_string())
     } else if model_lower.contains("opus") {
-        // 5.5 必须先于 opus-5 判断：`contains("opus-5")` 会同时匹配 opus-5.5
-        if model_lower.contains("opus-5-5") || model_lower.contains("opus-5.5") {
-            Some("claude-opus-5.5".to_string())
-        } else if model_lower.contains("opus-5") {
-            Some("claude-opus-5".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
-        }
+        // [fork 定制] opus 全族无条件用最新版，忽略请求里的版本号（不提给上游）
+        // 实测 Kiro 侧为点号形式 claude-opus-5.5（claude-opus-5-5 被上游拒绝）
+        Some("claude-opus-5.5".to_string())
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
@@ -966,13 +944,18 @@ fn merge_assistant_messages(
 mod tests {
     use super::*;
 
+    // [fork 定制] map_model 把 sonnet / opus 全族固定映射到 5.5，下面相关用例的期望值按此调整
+
     #[test]
     fn test_map_model_sonnet() {
         for (model, expected) in [
-            ("claude-sonnet-4-5-20250929", "claude-sonnet-4.5"),
-            ("claude-sonnet-4.5", "claude-sonnet-4.5"),
-            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
-            ("claude-sonnet-4.6", "claude-sonnet-4.6"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-5.5"),
+            ("claude-sonnet-4.5", "claude-sonnet-5.5"),
+            ("claude-sonnet-4-6", "claude-sonnet-5.5"),
+            ("claude-sonnet-4.6", "claude-sonnet-5.5"),
+            ("claude-sonnet-4", "claude-sonnet-5.5"),
+            ("claude-sonnet-4-20250514", "claude-sonnet-5.5"),
+            ("claude-3-5-sonnet-20241022", "claude-sonnet-5.5"),
         ] {
             assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
         }
@@ -981,12 +964,14 @@ mod tests {
     #[test]
     fn test_map_model_opus() {
         for (model, expected) in [
-            ("claude-opus-4-5-20251101", "claude-opus-4.5"),
-            ("claude-opus-4.5", "claude-opus-4.5"),
-            ("claude-opus-4-6", "claude-opus-4.6"),
-            ("claude-opus-4.6", "claude-opus-4.6"),
-            ("claude-opus-4-7", "claude-opus-4.7"),
-            ("claude-opus-4.7", "claude-opus-4.7"),
+            ("claude-opus-4-5-20251101", "claude-opus-5.5"),
+            ("claude-opus-4.5", "claude-opus-5.5"),
+            ("claude-opus-4-6", "claude-opus-5.5"),
+            ("claude-opus-4.6", "claude-opus-5.5"),
+            ("claude-opus-4-7", "claude-opus-5.5"),
+            ("claude-opus-4.7", "claude-opus-5.5"),
+            ("claude-opus-4", "claude-opus-5.5"),
+            ("claude-opus-4-20250514", "claude-opus-5.5"),
         ] {
             assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
         }
@@ -1003,37 +988,29 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        for model in [
-            "gpt-4",
-            "claude-sonnet-4",
-            "claude-sonnet-4-20250514",
-            "claude-3-5-sonnet-20241022",
-            "claude-opus-4",
-            "claude-opus-4-20250514",
-        ] {
-            assert_eq!(map_model(model), None, "{model}");
-        }
+        // 旧版 sonnet / opus 在本 fork 里也映射到 5.5，见 test_map_model_sonnet / test_map_model_opus
+        assert_eq!(map_model("gpt-4"), None);
     }
 
     #[test]
     fn test_map_model_thinking_suffix_sonnet() {
         // thinking 后缀不应影响 sonnet 模型映射
         let result = map_model("claude-sonnet-4-5-20250929-thinking");
-        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+        assert_eq!(result, Some("claude-sonnet-5.5".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_5() {
         // thinking 后缀不应影响 opus 4.5 模型映射
         let result = map_model("claude-opus-4-5-20251101-thinking");
-        assert_eq!(result, Some("claude-opus-4.5".to_string()));
+        assert_eq!(result, Some("claude-opus-5.5".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_6() {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
-        assert_eq!(result, Some("claude-opus-4.6".to_string()));
+        assert_eq!(result, Some("claude-opus-5.5".to_string()));
     }
 
     #[test]
@@ -1051,10 +1028,10 @@ mod tests {
             );
         }
         assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
-        // sonnet-5 不应被 5.5 分支吞掉
+        // sonnet-5 同样固定映射到 5.5
         assert_eq!(
             map_model("claude-sonnet-5"),
-            Some("claude-sonnet-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
     }
 
@@ -1062,17 +1039,17 @@ mod tests {
     fn test_map_model_sonnet_5() {
         assert_eq!(
             map_model("claude-sonnet-5"),
-            Some("claude-sonnet-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-sonnet-5-thinking"),
-            Some("claude-sonnet-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
-        // sonnet-4-5 不应误匹配为 sonnet-5
+        // sonnet-4-5 同样固定映射到 5.5
         assert_eq!(
             map_model("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4.5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
     }
 
@@ -1097,7 +1074,7 @@ mod tests {
         // fable 分支不应影响其他系列
         assert_eq!(
             map_model("claude-opus-5"),
-            Some("claude-opus-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
     }
 
@@ -1116,10 +1093,10 @@ mod tests {
             );
         }
         assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
-        // opus-5 不应被 5.5 分支吞掉
+        // opus-5 同样固定映射到 5.5
         assert_eq!(
             map_model("claude-opus-5"),
-            Some("claude-opus-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
     }
 
@@ -1127,17 +1104,17 @@ mod tests {
     fn test_map_model_opus_5() {
         assert_eq!(
             map_model("claude-opus-5"),
-            Some("claude-opus-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-opus-5-thinking"),
-            Some("claude-opus-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
-        // opus-4-5 不应误匹配为 opus-5
+        // opus-4-5 同样固定映射到 5.5
         assert_eq!(
             map_model("claude-opus-4-5-20251101"),
-            Some("claude-opus-4.5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
     }
 
@@ -1145,11 +1122,11 @@ mod tests {
     fn test_map_model_opus_4_8() {
         assert_eq!(
             map_model("claude-opus-4-8"),
-            Some("claude-opus-4.8".to_string())
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-opus-4-8-thinking"),
-            Some("claude-opus-4.8".to_string())
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
     }
