@@ -177,6 +177,9 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            // 后台为缺少邮箱的凭据补全账号邮箱，便于在 Admin 页面区分账号
+            tokio::spawn(token_manager.clone().backfill_missing_emails());
+
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);

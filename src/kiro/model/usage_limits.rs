@@ -19,6 +19,19 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 账号信息（请求携带 isEmailRequired=true 时返回）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 账号信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 账号邮箱
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// 订阅信息
@@ -141,6 +154,15 @@ impl UsageLimitsResponse {
             .and_then(|info| info.subscription_title.as_deref())
     }
 
+    /// 获取账号邮箱（去掉首尾空白，空字符串视为没有）
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+    }
+
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
@@ -198,5 +220,30 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_user_info_email() {
+        let usage: UsageLimitsResponse = serde_json::from_str(
+            r#"{"usageBreakdownList":[],"userInfo":{"email":"  user@example.com ","userId":"u-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.email(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn missing_or_blank_email_is_none() {
+        let without: UsageLimitsResponse =
+            serde_json::from_str(r#"{"usageBreakdownList":[]}"#).unwrap();
+        assert_eq!(without.email(), None);
+
+        let blank: UsageLimitsResponse =
+            serde_json::from_str(r#"{"usageBreakdownList":[],"userInfo":{"email":"  "}}"#).unwrap();
+        assert_eq!(blank.email(), None);
     }
 }
