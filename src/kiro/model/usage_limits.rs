@@ -243,8 +243,7 @@ mod tests {
         assert_eq!(without.email(), None);
 
         let blank: UsageLimitsResponse =
-            serde_json::from_str(r#"{"usageBreakdownList":[],"userInfo":{"email":"  "}}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"usageBreakdownList":[],"userInfo":{"email":"  "}}"#).unwrap();
         assert_eq!(blank.email(), None);
     }
 }
