@@ -849,9 +849,19 @@ fn log_upstream_request(
     let current = &state.current_message.user_input_message;
     let tools = &current.user_input_message_context.tools;
     let tools_bytes = serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0);
+    // 实际发给上游的原生 effort / thinking，"-" 表示没传（上游用模型默认值）
+    let native = kiro_request.additional_model_request_fields.as_ref();
+    let effort = native
+        .and_then(|f| f.output_config.as_ref())
+        .map_or("-", |c| c.effort.as_str());
+    let thinking = native
+        .and_then(|f| f.thinking.as_ref())
+        .map_or("-", |t| t.thinking_type.as_str());
     tracing::info!(
         upstream_model = %current.model_id,
         client_model = %client_model,
+        effort,
+        thinking,
         history = state.history.len(),
         tools = tools.len(),
         tools_bytes,
