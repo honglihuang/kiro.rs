@@ -179,7 +179,11 @@ impl AdminService {
             .token_manager
             .get_usage_limits_for(id)
             .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
+            .map_err(|e| {
+                // [fork 定制] 余额查询失败原本只回给 Admin 页面，不进日志，补一条便于事后排查
+                tracing::warn!("凭据 #{} 获取使用额度失败: {:#}", id, e);
+                self.classify_balance_error(e, id)
+            })?;
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
