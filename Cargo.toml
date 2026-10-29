@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["native-tls"]
 native-tls = ["reqwest/native-tls-vendored"]
+sensitive-logs = []  # 启用后输出完整请求体日志（仅用于调试）
 
 [profile.release]
 lto = true
