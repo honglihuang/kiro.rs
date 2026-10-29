@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -338,7 +339,7 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 URL
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     );
 
@@ -1622,38 +1623,85 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
-                        tracing::info!(
-                            "凭据 #{} 订阅等级已更新: {:?} -> {}",
-                            id,
-                            old_title,
-                            subscription_title
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
-                }
-            }
+        // 更新订阅等级与账号邮箱到凭据（仅在发生变化时持久化）
+        if self.apply_usage_identity(id, usage_limits.subscription_title(), usage_limits.email())
+            && let Err(e) = self.persist_credentials()
+        {
+            tracing::warn!("凭据信息更新后持久化失败（不影响本次请求）: {}", e);
         }
 
         Ok(usage_limits)
+    }
+
+    /// 用使用额度响应里的订阅等级和账号邮箱更新内存中的凭据，返回是否有变化
+    fn apply_usage_identity(
+        &self,
+        id: u64,
+        subscription_title: Option<&str>,
+        email: Option<&str>,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if let Some(subscription_title) = subscription_title {
+            let old_title = entry.credentials.subscription_title.clone();
+            if old_title.as_deref() != Some(subscription_title) {
+                entry.credentials.subscription_title = Some(subscription_title.to_string());
+                tracing::info!(
+                    "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                    id,
+                    old_title,
+                    subscription_title
+                );
+                changed = true;
+            }
+        }
+        if let Some(email) = email
+            && entry.credentials.email.as_deref() != Some(email)
+        {
+            entry.credentials.email = Some(email.to_string());
+            // 邮箱属于账号隐私，只记录发生了更新
+            tracing::info!("凭据 #{} 账号邮箱已更新", id);
+            changed = true;
+        }
+        changed
+    }
+
+    /// 尚未记录账号邮箱的已启用凭据 ID
+    fn ids_missing_email(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && e.credentials.email.is_none())
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 为缺少邮箱的凭据补全账号邮箱（启动时后台执行一次）
+    ///
+    /// 逐个查询使用额度，响应中的账号邮箱会写回凭据文件，Admin 页面即可直接显示。
+    /// 单个凭据查询失败只记录日志，不影响其它凭据和正常请求。
+    pub async fn backfill_missing_emails(self: Arc<Self>) {
+        let ids = self.ids_missing_email();
+        if ids.is_empty() {
+            return;
+        }
+        tracing::info!("开始为 {} 个凭据补全账号邮箱", ids.len());
+        let mut filled = 0usize;
+        for (index, id) in ids.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(StdDuration::from_millis(500)).await;
+            }
+            match self.get_usage_limits_for(*id).await {
+                Ok(usage) if usage.email().is_some() => filled += 1,
+                Ok(_) => tracing::debug!("凭据 #{} 的使用额度响应中没有账号邮箱", id),
+                Err(e) => tracing::warn!("凭据 #{} 补全账号邮箱失败: {}", id, e),
+            }
+        }
+        tracing::info!("账号邮箱补全完成：{}/{}", filled, ids.len());
     }
 
     /// 添加新凭据（Admin API）
@@ -2037,6 +2085,42 @@ mod tests {
             err_msg.contains("API Key 凭据不支持刷新"),
             "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn test_apply_usage_identity_fills_missing_email() {
+        let first = KiroCredentials {
+            refresh_token: Some("a".repeat(150)),
+            ..Default::default()
+        };
+        let second = KiroCredentials {
+            refresh_token: Some("b".repeat(150)),
+            email: Some("known@example.com".to_string()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+        let ids: Vec<u64> = manager.snapshot().entries.iter().map(|e| e.id).collect();
+
+        assert_eq!(manager.ids_missing_email(), vec![ids[0]]);
+        assert!(manager.apply_usage_identity(ids[0], None, Some("new@example.com")));
+        assert!(!manager.apply_usage_identity(ids[0], None, Some("new@example.com")));
+        assert!(manager.ids_missing_email().is_empty());
+
+        let emails: Vec<Option<String>> = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|e| e.email)
+            .collect();
+        assert_eq!(
+            emails,
+            vec![
+                Some("new@example.com".to_string()),
+                Some("known@example.com".to_string())
+            ]
         );
     }
 

@@ -394,6 +394,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     setQueryingInfo(false)
+    // 查询余额时后端会顺带补全账号邮箱，立即刷新列表以显示
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)

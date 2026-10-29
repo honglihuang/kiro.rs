@@ -219,6 +219,11 @@ export function CredentialCard({
                 ) : (
                   <span className="flex items-center gap-1">
                     {credential.name || credential.email || `凭据 #${credential.id}`}
+                    {(credential.name || credential.email) && (
+                      <span className="text-xs font-normal text-muted-foreground">
+                        #{credential.id}
+                      </span>
+                    )}
                     <Pencil
                       className="h-3.5 w-3.5 text-muted-foreground cursor-pointer hover:text-foreground"
                       onClick={() => {
@@ -263,6 +268,14 @@ export function CredentialCard({
         <CardContent className="space-y-4">
           {/* 信息网格 */}
           <div className="grid grid-cols-2 gap-4 text-sm">
+            <div className="col-span-2">
+              <span className="text-muted-foreground">账号：</span>
+              {credential.email ? (
+                <span className="font-medium break-all">{credential.email}</span>
+              ) : (
+                <span className="text-muted-foreground">未获取（查询余额后自动补全）</span>
+              )}
+            </div>
             <div>
               <span className="text-muted-foreground">优先级：</span>
               {editingPriority ? (
