@@ -1670,14 +1670,21 @@ impl MultiTokenManager {
         changed
     }
 
-    /// 尚未记录账号邮箱的已启用凭据 ID
+    /// 尚未记录账号邮箱的凭据 ID，已启用的排在前面
+    ///
+    /// 已禁用的凭据也包含在内：Admin 页面要靠邮箱区分所有账号，
+    /// 查询使用额度不会改变凭据的启用状态和失败计数。
     fn ids_missing_email(&self) -> Vec<u64> {
-        self.entries
+        let mut missing: Vec<(bool, u64)> = self
+            .entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && e.credentials.email.is_none())
-            .map(|e| e.id)
-            .collect()
+            .filter(|e| e.credentials.email.is_none())
+            .map(|e| (e.disabled, e.id))
+            .collect();
+        // 稳定排序，false 在前：已启用的凭据先补全
+        missing.sort_by_key(|(disabled, _)| *disabled);
+        missing.into_iter().map(|(_, id)| id).collect()
     }
 
     /// 为缺少邮箱的凭据补全账号邮箱（启动时后台执行一次）
@@ -2090,6 +2097,11 @@ mod tests {
 
     #[test]
     fn test_apply_usage_identity_fills_missing_email() {
+        let disabled = KiroCredentials {
+            refresh_token: Some("c".repeat(150)),
+            disabled: true,
+            ..Default::default()
+        };
         let first = KiroCredentials {
             refresh_token: Some("a".repeat(150)),
             ..Default::default()
@@ -2099,15 +2111,21 @@ mod tests {
             email: Some("known@example.com".to_string()),
             ..Default::default()
         };
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![disabled, first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let ids: Vec<u64> = manager.snapshot().entries.iter().map(|e| e.id).collect();
 
+        // 已禁用的凭据也要补全，但排在已启用的后面
+        assert_eq!(manager.ids_missing_email(), vec![ids[1], ids[0]]);
+        assert!(manager.apply_usage_identity(ids[1], None, Some("new@example.com")));
+        assert!(!manager.apply_usage_identity(ids[1], None, Some("new@example.com")));
         assert_eq!(manager.ids_missing_email(), vec![ids[0]]);
-        assert!(manager.apply_usage_identity(ids[0], None, Some("new@example.com")));
-        assert!(!manager.apply_usage_identity(ids[0], None, Some("new@example.com")));
-        assert!(manager.ids_missing_email().is_empty());
 
         let emails: Vec<Option<String>> = manager
             .snapshot()
@@ -2118,6 +2136,7 @@ mod tests {
         assert_eq!(
             emails,
             vec![
+                None,
                 Some("new@example.com".to_string()),
                 Some("known@example.com".to_string())
             ]
