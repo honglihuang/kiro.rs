@@ -85,7 +85,10 @@ pub fn map_model(model: &str) -> Option<String> {
         // 目前 Kiro 仅上线 5.1 一个 Fable 版本，故与 haiku 分支一致采用无条件映射
         Some("claude-fable-5.1".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") {
+        // 5.5 必须先于 sonnet-5 判断：`contains("sonnet-5")` 会同时匹配 sonnet-5.5
+        if model_lower.contains("sonnet-5-5") || model_lower.contains("sonnet-5.5") {
+            Some("claude-sonnet-5.5".to_string())
+        } else if model_lower.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -122,11 +125,12 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
+/// Sonnet 5 / 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-fable-5.1"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-5.5"
                 || mapped == "claude-opus-5"
@@ -285,6 +289,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let text_content = replace_long_tool_names(&text_content, &tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
@@ -629,6 +634,15 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     short
 }
 
+/// Replace original long tool names in prompt text with the aliases sent to Kiro.
+fn replace_long_tool_names(text: &str, tool_name_map: &HashMap<String, String>) -> String {
+    tool_name_map
+        .iter()
+        .fold(text.to_string(), |content, (short, original)| {
+            content.replace(original, short)
+        })
+}
+
 /// 转换工具定义
 fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
     let Some(tools) = tools else {
@@ -772,7 +786,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, tool_name_map)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -789,7 +803,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, tool_name_map)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -804,6 +818,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    tool_name_map: &HashMap<String, String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
@@ -818,7 +833,7 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let content = replace_long_tool_names(&content_parts.join("\n"), tool_name_map);
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -953,25 +968,28 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        for (model, expected) in [
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4.5"),
+            ("claude-sonnet-4.5", "claude-sonnet-4.5"),
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-sonnet-4.6", "claude-sonnet-4.6"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
+        }
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        for (model, expected) in [
+            ("claude-opus-4-5-20251101", "claude-opus-4.5"),
+            ("claude-opus-4.5", "claude-opus-4.5"),
+            ("claude-opus-4-6", "claude-opus-4.6"),
+            ("claude-opus-4.6", "claude-opus-4.6"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-opus-4.7", "claude-opus-4.7"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
+        }
     }
 
     #[test]
@@ -985,7 +1003,16 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        for model in [
+            "gpt-4",
+            "claude-sonnet-4",
+            "claude-sonnet-4-20250514",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-4",
+            "claude-opus-4-20250514",
+        ] {
+            assert_eq!(map_model(model), None, "{model}");
+        }
     }
 
     #[test]
@@ -1007,6 +1034,28 @@ mod tests {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5_5() {
+        for name in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5-5-thinking",
+            "claude-sonnet-5.5-20260928",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-sonnet-5.5".to_string()),
+                "{name} should map to claude-sonnet-5.5"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        // sonnet-5 不应被 5.5 分支吞掉
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
     }
 
     #[test]
@@ -1116,7 +1165,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1220,7 +1269,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1260,6 +1309,48 @@ mod tests {
     }
 
     #[test]
+    fn test_long_tool_name_in_prompt_is_mapped() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+
+        let req = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(format!("Call {long_tool_name} now.")),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: long_tool_name.to_string(),
+                description: "A test tool".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let short_name = result.tool_name_map.keys().next().unwrap();
+        let content = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(content.contains(short_name));
+        assert!(!content.contains(long_tool_name));
+    }
+
+    #[test]
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
@@ -1270,7 +1361,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1333,7 +1424,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1432,7 +1523,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1464,7 +1555,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1871,7 +1962,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
