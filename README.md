@@ -371,6 +371,12 @@ docker-compose up
 RUST_LOG=debug ./target/release/kiro-rs
 ```
 
+### 日志文件
+
+除控制台外，日志还会写入 `config.json` 所在目录下的 `logs/kiro-rs.YYYY-MM-DD.log`，按天切分（按 UTC 日期），保留最近 30 天。时间戳为本地时间。
+
+每个 `/v1/messages`、`/cc/v1/messages` 请求带一个 `req{id=…}` 前缀，同一请求的所有日志（转换、选用的凭据、重试、上游完成情况）都可以按这个 id 串起来。日志不记录消息内容。
+
 ## API 端点
 
 ### 标准端点 (/v1)

@@ -25,6 +25,13 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 上游请求总超时（秒），2 小时
+///
+/// reqwest 的 timeout 从发起请求一直计到响应体读完，流式输出期间不会续期，
+/// 所以它实际上是单个回合的时长上限。原来的 12 分钟会切断 effort=max 的长回合，
+/// 已生成的部分照样扣费。
+const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -66,8 +73,9 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), UPSTREAM_REQUEST_TIMEOUT_SECS, tls_backend)
+                .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -88,7 +96,11 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client(
+            effective.as_ref(),
+            UPSTREAM_REQUEST_TIMEOUT_SECS,
+            self.tls_backend,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -330,10 +342,12 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
+            let attempt_start = std::time::Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
+                        credential = ctx.id,
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
                         max_retries,
@@ -354,6 +368,12 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                tracing::info!(
+                    credential = ctx.id,
+                    attempt = attempt + 1,
+                    headers_ms = attempt_start.elapsed().as_millis() as u64,
+                    "上游已响应"
+                );
                 return Ok(response);
             }
 
@@ -363,6 +383,7 @@ impl KiroProvider {
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
+                    credential = ctx.id,
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -391,12 +412,18 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                tracing::warn!(
+                    credential = ctx.id,
+                    attempt = attempt + 1,
+                    "上游返回 400，不重试"
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
+                    credential = ctx.id,
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -438,6 +465,7 @@ impl KiroProvider {
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
+                    credential = ctx.id,
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -458,11 +486,13 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                tracing::warn!(credential = ctx.id, attempt = attempt + 1, status = %status, "上游返回 4xx，不重试");
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
+                credential = ctx.id,
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
                 max_retries,

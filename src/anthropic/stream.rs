@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, MetadataEvent};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -548,6 +548,32 @@ pub struct StreamContext {
     /// [fork 定制] 耗时测量：上下文创建时刻（约等于上游请求发出时刻）、首个上游事件时刻
     timing_start: Instant,
     timing_first_event: Option<Instant>,
+    /// [fork 定制] 上游响应统计，只用于日志
+    upstream_stats: UpstreamStats,
+}
+
+/// [fork 定制] 一次请求的上游响应统计（只用于日志，不影响返回给客户端的内容）
+///
+/// 额度和推理量跨透明重试累计，因为每次上游响应都会计费；
+/// 停止原因和上下文占比取最后一次上游响应的值。
+#[derive(Debug, Default, Clone)]
+pub struct UpstreamStats {
+    /// meteringEvent 累计消耗的额度（credit）
+    pub credits: f64,
+    /// reasoningContentEvent 数量
+    pub reasoning_events: u32,
+    /// reasoningContentEvent 文本字符数
+    pub reasoning_chars: usize,
+    /// metadataEvent 给出的停止原因
+    pub stop_reason: Option<String>,
+    /// 内容过滤拒答类别
+    pub refusal_category: Option<String>,
+    /// metadataEvent 里的 tokenUsage 原文（大多数响应没有）
+    pub token_usage: Option<String>,
+    /// contextUsageEvent 给出的上下文占比（%）
+    pub context_usage_pct: Option<f64>,
+    /// 已用掉的空输出透明重试次数
+    pub empty_retries: u32,
 }
 
 impl StreamContext {
@@ -577,7 +603,33 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             timing_start: Instant::now(),
             timing_first_event: None,
+            upstream_stats: UpstreamStats::default(),
         }
+    }
+
+    /// [fork 定制] 上游响应统计（用于日志）
+    pub fn upstream_stats(&self) -> &UpstreamStats {
+        &self.upstream_stats
+    }
+
+    /// [fork 定制] 记录 metadataEvent；非正常结束（截断、拒答等）时打一条 warn
+    fn record_upstream_metadata(&mut self, metadata: &MetadataEvent) {
+        if let Some(usage) = &metadata.token_usage {
+            self.upstream_stats.token_usage = Some(usage.to_string());
+        }
+        let Some(stop_reason) = metadata.stop_reason.clone() else {
+            return;
+        };
+        if !matches!(stop_reason.as_str(), "END_TURN" | "TOOL_USE") {
+            tracing::warn!(
+                stop_reason = %stop_reason,
+                refusal = metadata.refusal_category().unwrap_or("-"),
+                explanation = metadata.refusal_explanation().unwrap_or("-"),
+                "上游报告非正常停止原因"
+            );
+        }
+        self.upstream_stats.refusal_category = metadata.refusal_category().map(str::to_string);
+        self.upstream_stats.stop_reason = Some(stop_reason);
     }
 
     /// [fork 定制] 把计时起点对齐到上游请求发出前，而不是上下文创建时
@@ -621,6 +673,11 @@ impl StreamContext {
     pub fn reset_for_upstream_retry(&mut self) {
         self.context_input_tokens = None;
         self.unknown_event_counts.clear();
+        // [fork 定制] 额度与推理量继续累计；停止原因只看最后一次上游响应
+        self.upstream_stats.empty_retries += 1;
+        self.upstream_stats.stop_reason = None;
+        self.upstream_stats.refusal_category = None;
+        self.upstream_stats.context_usage_pct = None;
     }
 
     /// 生成 message_start 事件
@@ -697,6 +754,8 @@ impl StreamContext {
                     * (window_size as f64)
                     / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
+                self.upstream_stats.context_usage_pct =
+                    Some(context_usage.context_usage_percentage);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
@@ -725,6 +784,20 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                Vec::new()
+            }
+            // [fork 定制] 以下事件只做统计，不产生客户端事件
+            Event::Metering(metering) => {
+                self.upstream_stats.credits += metering.usage.unwrap_or(0.0);
+                Vec::new()
+            }
+            Event::ReasoningContent(reasoning) => {
+                self.upstream_stats.reasoning_events += 1;
+                self.upstream_stats.reasoning_chars += reasoning.text.chars().count();
+                Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                self.record_upstream_metadata(metadata);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1182,6 +1255,8 @@ impl StreamContext {
         let ttfb_ms = self
             .timing_first_event
             .map(|t| t.duration_since(self.timing_start).as_millis());
+        // credits / reasoning 跨透明重试累计；upstream_stop 是 metadataEvent 给的原始停止原因
+        let stats = &self.upstream_stats;
         tracing::info!(
             model = %self.model,
             ttfb_ms = ?ttfb_ms,
@@ -1191,6 +1266,15 @@ impl StreamContext {
             est_input_tokens = self.input_tokens,
             output_tokens = self.output_tokens,
             stop_reason = %self.state_manager.get_stop_reason(),
+            upstream_stop = stats.stop_reason.as_deref().unwrap_or("-"),
+            refusal = stats.refusal_category.as_deref().unwrap_or("-"),
+            credits = %format!("{:.4}", stats.credits),
+            context_pct = ?stats.context_usage_pct,
+            reasoning_events = stats.reasoning_events,
+            reasoning_chars = stats.reasoning_chars,
+            empty_retries = stats.empty_retries,
+            unknown_events = %self.unknown_event_summary(),
+            token_usage = stats.token_usage.as_deref().unwrap_or("-"),
             "上游请求完成"
         );
 
@@ -1326,6 +1410,36 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_upstream_stats_accumulate_across_retry() {
+        use crate::kiro::model::events::{MeteringEvent, ReasoningContentEvent};
+
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 10, true, HashMap::new());
+        ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "思考中".to_string(),
+        }));
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent { usage: Some(0.25) }));
+        ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            stop_reason: Some("CONTENT_FILTERED".to_string()),
+            ..Default::default()
+        }));
+        assert_eq!(ctx.upstream_stats().reasoning_chars, 3);
+        assert_eq!(
+            ctx.upstream_stats().stop_reason.as_deref(),
+            Some("CONTENT_FILTERED")
+        );
+        // 统计类事件不产生客户端可见输出，行为与之前一致：仍会透明重试
+        assert!(ctx.should_retry_empty_output());
+
+        ctx.reset_for_upstream_retry();
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent { usage: Some(0.5) }));
+        let stats = ctx.upstream_stats();
+        assert!((stats.credits - 0.75).abs() < 1e-9);
+        assert_eq!(stats.reasoning_events, 1);
+        assert_eq!(stats.empty_retries, 1);
+        assert!(stats.stop_reason.is_none());
+    }
 
     #[test]
     fn test_sse_event_format() {

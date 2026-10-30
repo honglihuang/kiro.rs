@@ -126,8 +126,12 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
+/// 默认上报的 Kiro IDE 版本号
+///
+/// 上游会按版本号区别对待：旧版本（如 0.11.107）每个请求会多算约 4.8k token 上下文，
+/// 也收不到 metadataEvent（停止原因）。与当前 Kiro IDE 保持一致。
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    "1.2.37".to_string()
 }
 
 fn default_system_version() -> String {

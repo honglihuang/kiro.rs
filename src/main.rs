@@ -8,6 +8,7 @@ mod model;
 pub mod token;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -18,27 +19,110 @@ use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
 
+/// 日志文件保留天数
+const LOG_RETENTION_DAYS: usize = 30;
+
+/// 日志目录：config.json 所在目录下的 `logs/`
+fn log_dir_for(config_path: &str) -> PathBuf {
+    Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("logs")
+}
+
+/// 文件日志专用的字段格式化器
+///
+/// 和控制台用同一个格式化器类型时，span 字段（如 `req{id=…}`）会复用控制台
+/// 带颜色码的格式化结果；换成独立类型后，文件里的 span 字段也是纯文本。
+struct PlainFields(tracing_subscriber::fmt::format::DefaultFields);
+
+impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for PlainFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: tracing_subscriber::fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
+
+/// 初始化日志
+///
+/// 控制台输出保持不变；同时按天写入 `logs/kiro-rs.YYYY-MM-DD.log`（不含颜色码），
+/// 只保留最近 [`LOG_RETENTION_DAYS`] 个文件。时间戳统一用带时区的本地时间。
+fn init_logging(log_dir: &Path) {
+    use tracing_subscriber::fmt::time::ChronoLocal;
+    use tracing_subscriber::prelude::*;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let timer = || ChronoLocal::new("%Y-%m-%dT%H:%M:%S%.3f%:z".to_string());
+    let console = tracing_subscriber::fmt::layer().with_timer(timer());
+
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("kiro-rs")
+        .filename_suffix("log")
+        .max_log_files(LOG_RETENTION_DAYS)
+        .build(log_dir);
+
+    match file_appender {
+        Ok(appender) => {
+            let file = tracing_subscriber::fmt::layer()
+                .fmt_fields(PlainFields(Default::default()))
+                .with_timer(timer())
+                .with_ansi(false)
+                .with_writer(appender);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .with(file)
+                .init();
+        }
+        Err(e) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .init();
+            tracing::warn!(
+                "无法创建日志目录 {}，日志只输出到控制台: {}",
+                log_dir.display(),
+                e
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    // 加载配置
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
+
+    // 初始化日志（控制台 + 日志文件）
+    let log_dir = log_dir_for(&config_path);
+    init_logging(&log_dir);
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        log_dir = %log_dir.display(),
+        "kiro-rs 启动"
+    );
+
+    // 加载配置
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+    tracing::info!(
+        config = %config_path,
+        kiro_version = %config.kiro_version,
+        region = %config.region,
+        load_balancing = %config.load_balancing_mode,
+        "配置已加载"
+    );
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
@@ -73,9 +157,13 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
+    // 获取第一个凭据用于日志显示（日志会落盘，不输出 token 等敏感字段）
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    tracing::debug!(
+        id = ?first_credentials.id,
+        auth_method = ?first_credentials.auth_method,
+        "主凭证"
+    );
 
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
@@ -219,4 +307,18 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_dir_is_next_to_config() {
+        assert_eq!(
+            log_dir_for("/srv/kiro/config.json"),
+            Path::new("/srv/kiro").join("logs")
+        );
+        assert_eq!(log_dir_for("config.json"), Path::new("logs"));
+    }
 }
