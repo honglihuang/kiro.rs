@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
@@ -302,18 +303,45 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// [fork 定制] 每个请求一个短 id，同一请求的所有日志（含流式阶段）都带 `req{id=…}` 前缀
+fn request_span() -> tracing::Span {
+    let id = Uuid::new_v4().simple().to_string();
+    tracing::info_span!("req", id = %&id[..8])
+}
+
+/// [fork 定制] 轮询流时进入当前 span，让响应流里打出的日志也带上请求 id
+fn in_current_span<S>(stream: S) -> impl Stream<Item = S::Item> + Send + 'static
+where
+    S: Stream + Send + 'static,
+{
+    let span = tracing::Span::current();
+    let mut inner = stream.boxed();
+    stream::poll_fn(move |cx| {
+        let _entered = span.enter();
+        inner.poll_next_unpin(cx)
+    })
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    post_messages_inner(state, payload)
+        .instrument(request_span())
+        .await
+}
+
+async fn post_messages_inner(state: AppState, mut payload: MessagesRequest) -> Response {
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        thinking = payload.thinking.as_ref().map_or("-", |t| t.thinking_type.as_str()),
+        effort = payload.output_config.as_ref().map_or("-", |c| c.effort.as_str()),
         "Received POST /v1/messages request"
     );
     // 检查 KiroProvider 是否可用
@@ -483,7 +511,7 @@ async fn handle_stream_request(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(in_current_span(stream)))
         .unwrap()
 }
 
@@ -530,9 +558,13 @@ async fn retry_empty_upstream_output(state: &mut SseStreamState) -> bool {
         return false;
     }
     state.retries_left -= 1;
+    let stats = state.ctx.upstream_stats();
     tracing::warn!(
         retries_left = state.retries_left,
         unknown_events = %state.ctx.unknown_event_summary(),
+        reasoning_events = stats.reasoning_events,
+        upstream_stop = stats.stop_reason.as_deref().unwrap_or("-"),
+        refusal = stats.refusal_category.as_deref().unwrap_or("-"),
         actual_input_tokens = ?state.ctx.context_input_tokens,
         "上游流结束但没有可见输出，透明重试"
     );
@@ -663,6 +695,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let upstream_start = std::time::Instant::now();
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
@@ -696,6 +729,10 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // [fork 定制] 只用于日志的上游统计
+    let mut credits = 0.0_f64;
+    let mut reasoning_chars = 0_usize;
+    let mut upstream_stop: Option<String> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -769,6 +806,11 @@ async fn handle_non_stream_request(
                                 stop_reason = "max_tokens".to_string();
                             }
                         }
+                        Event::Metering(metering) => credits += metering.usage.unwrap_or(0.0),
+                        Event::ReasoningContent(reasoning) => {
+                            reasoning_chars += reasoning.text.chars().count();
+                        }
+                        Event::Metadata(metadata) => upstream_stop = metadata.stop_reason,
                         _ => {}
                     }
                 }
@@ -835,6 +877,20 @@ async fn handle_non_stream_request(
         }
     });
 
+    // [fork 定制] 与流式路径的"上游请求完成"对应
+    tracing::info!(
+        model = %model,
+        total_ms = upstream_start.elapsed().as_millis() as u64,
+        actual_input_tokens = ?context_input_tokens,
+        est_input_tokens = input_tokens,
+        output_tokens,
+        stop_reason = %stop_reason,
+        upstream_stop = upstream_stop.as_deref().unwrap_or("-"),
+        credits = %format!("{:.4}", credits),
+        reasoning_chars,
+        "上游请求完成（非流式）"
+    );
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -857,11 +913,17 @@ fn log_upstream_request(
     let thinking = native
         .and_then(|f| f.thinking.as_ref())
         .map_or("-", |t| t.thinking_type.as_str());
+    // conversationId 来自 Claude Code 的会话 id，取前 8 位用于按会话归类日志
+    let session = state
+        .conversation_id
+        .get(..8)
+        .unwrap_or(&state.conversation_id);
     tracing::info!(
         upstream_model = %current.model_id,
         client_model = %client_model,
         effort,
         thinking,
+        session,
         history = state.history.len(),
         tools = tools.len(),
         tools_bytes,
@@ -944,13 +1006,21 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    post_messages_cc_inner(state, payload)
+        .instrument(request_span())
+        .await
+}
+
+async fn post_messages_cc_inner(state: AppState, mut payload: MessagesRequest) -> Response {
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        thinking = payload.thinking.as_ref().map_or("-", |t| t.thinking_type.as_str()),
+        effort = payload.output_config.as_ref().map_or("-", |c| c.effort.as_str()),
         "Received POST /cc/v1/messages request"
     );
 
@@ -1111,7 +1181,7 @@ async fn handle_stream_request_buffered(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(in_current_span(stream)))
         .unwrap()
 }
 

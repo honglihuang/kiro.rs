@@ -17,4 +17,5 @@
 /一键配置并启动Kiro代理.bat
 /一键配置并启动Kiro代理.bat.bak
 /kiro-proxy*.log
+/logs/
 /target-verify/
