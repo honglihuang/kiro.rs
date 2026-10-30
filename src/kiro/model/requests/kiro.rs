@@ -55,6 +55,9 @@ pub struct AdditionalModelRequestFields {
     /// 思考模式，对应 Anthropic 的 `thinking.type`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ModelThinking>,
+    /// 输出上限（含推理），对应 Anthropic 的 `max_tokens`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
 }
 
 /// 推理强度（low / medium / high / xhigh / max，具体可选值由模型决定）
@@ -117,6 +120,7 @@ mod tests {
             thinking: Some(ModelThinking {
                 thinking_type: "adaptive".to_string(),
             }),
+            max_tokens: Some(64000),
         });
         let value = serde_json::to_value(&request).unwrap();
         // 外层 camelCase，内层保持 snake_case
@@ -124,7 +128,8 @@ mod tests {
             value["additionalModelRequestFields"],
             serde_json::json!({
                 "output_config": {"effort": "max"},
-                "thinking": {"type": "adaptive"}
+                "thinking": {"type": "adaptive"},
+                "max_tokens": 64000
             })
         );
     }

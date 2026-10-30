@@ -133,7 +133,7 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
-    /// Kiro 原生的推理强度 / 思考模式参数，模型不支持时为 None
+    /// Kiro 原生的推理强度 / 思考模式 / 输出上限参数，模型不支持时为 None
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
@@ -154,7 +154,7 @@ fn native_effort_levels(model_id: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// 把 Anthropic 的 `output_config.effort` / `thinking` 转成 Kiro 原生的 `additionalModelRequestFields`
+/// 把 Anthropic 的 `output_config.effort` / `thinking` / `max_tokens` 转成 Kiro 原生的 `additionalModelRequestFields`
 ///
 /// 写进提示词的 `<thinking_effort>` 标签不会改变上游实际的推理强度，
 /// 不传这个字段时上游按模型默认档位运行（例如 claude-opus-5.5 默认 medium）。
@@ -189,14 +189,20 @@ fn build_additional_model_request_fields(
             thinking_type: "adaptive".to_string(),
         });
 
-    if output_config.is_none() && thinking.is_none() {
-        return None;
-    }
+    // 不传 max_tokens 时上游按自己的默认上限截断（实测约 32k）；
+    // 客户端的值超出模型允许范围时取边界值，否则上游会 400
+    let (min_tokens, max_tokens) = NATIVE_MAX_TOKENS_RANGE;
+    let max_tokens = Some(req.max_tokens.clamp(min_tokens, max_tokens));
+
     Some(AdditionalModelRequestFields {
         output_config,
         thinking,
+        max_tokens,
     })
 }
+
+/// 原生 `max_tokens` 的允许范围：上面表内的模型在 ListAvailableModels 里都是 1024–64000
+const NATIVE_MAX_TOKENS_RANGE: (i32, i32) = (1024, 64000);
 
 /// 转换错误
 #[derive(Debug)]
@@ -1279,9 +1285,22 @@ mod tests {
         assert!(fields.output_config.is_none());
         assert_eq!(fields.thinking.unwrap().thinking_type, "adaptive");
 
-        // 两者都没有：不传
+        // 两者都没有：只带 max_tokens
         let req = effort_request("claude-opus-4-8", None, None);
-        assert!(build_additional_model_request_fields(&req, "claude-opus-4.8").is_none());
+        let fields = build_additional_model_request_fields(&req, "claude-opus-4.8").unwrap();
+        assert!(fields.output_config.is_none());
+        assert!(fields.thinking.is_none());
+        assert_eq!(fields.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn test_native_max_tokens_clamped_to_model_range() {
+        let mut req = effort_request("claude-opus-5-5", Some("adaptive"), Some("max"));
+        for (requested, sent) in [(64000, 64000), (32000, 32000), (128000, 64000), (512, 1024)] {
+            req.max_tokens = requested;
+            let fields = build_additional_model_request_fields(&req, "claude-opus-5.5").unwrap();
+            assert_eq!(fields.max_tokens, Some(sent), "requested {requested}");
+        }
     }
 
     #[test]

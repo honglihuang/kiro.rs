@@ -821,6 +821,15 @@ async fn handle_non_stream_request(
         }
     }
 
+    // [fork 定制] 上游明确给出的截断 / 拒答原因：拒答优先于一切，截断不覆盖已确定的上下文溢出
+    if let Some(mapped) = upstream_stop
+        .as_deref()
+        .and_then(super::stream::stop_reason_for_upstream)
+        && (mapped == super::stream::REFUSAL_STOP_REASON || stop_reason == "end_turn")
+    {
+        stop_reason = mapped.to_string();
+    }
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
@@ -913,6 +922,7 @@ fn log_upstream_request(
     let thinking = native
         .and_then(|f| f.thinking.as_ref())
         .map_or("-", |t| t.thinking_type.as_str());
+    let max_tokens = native.and_then(|f| f.max_tokens);
     // conversationId 来自 Claude Code 的会话 id，取前 8 位用于按会话归类日志
     let session = state
         .conversation_id
@@ -923,6 +933,7 @@ fn log_upstream_request(
         client_model = %client_model,
         effort,
         thinking,
+        max_tokens = ?max_tokens,
         session,
         history = state.history.len(),
         tools = tools.len(),
