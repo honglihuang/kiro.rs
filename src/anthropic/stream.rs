@@ -10,6 +10,23 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataEvent};
 
+/// 上游内容过滤拒答（`metadataEvent.stopReason = CONTENT_FILTERED`）对应的 Anthropic stop_reason
+pub const REFUSAL_STOP_REASON: &str = "refusal";
+
+/// 把 metadataEvent 的停止原因映射为 Anthropic stop_reason
+///
+/// 只映射需要告诉客户端的情况：拒答和各类截断。END_TURN / TOOL_USE 返回 None，
+/// 仍由本地根据是否有工具调用决定。
+pub fn stop_reason_for_upstream(upstream: &str) -> Option<&'static str> {
+    match upstream {
+        "CONTENT_FILTERED" => Some(REFUSAL_STOP_REASON),
+        "MAX_TOKENS" => Some("max_tokens"),
+        "STOP_SEQUENCE" => Some("stop_sequence"),
+        "MODEL_CONTEXT_WINDOW_EXCEEDED" => Some("model_context_window_exceeded"),
+        _ => None,
+    }
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -333,7 +350,13 @@ impl SseStateManager {
     }
 
     /// 设置 stop_reason
+    ///
+    /// `refusal`（上游内容过滤）是终态，之后的上下文溢出、max_tokens 等都不再覆盖它，
+    /// 否则 Claude Code 会去压缩上下文再重发同一段被拦截的对话。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
     }
 
@@ -627,6 +650,10 @@ impl StreamContext {
                 explanation = metadata.refusal_explanation().unwrap_or("-"),
                 "上游报告非正常停止原因"
             );
+        }
+        // 截断和拒答如实告诉客户端；设置后也不会再触发空输出透明重试
+        if let Some(mapped) = stop_reason_for_upstream(&stop_reason) {
+            self.state_manager.set_stop_reason(mapped);
         }
         self.upstream_stats.refusal_category = metadata.refusal_category().map(str::to_string);
         self.upstream_stats.stop_reason = Some(stop_reason);
@@ -1241,7 +1268,11 @@ impl StreamContext {
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
-            self.state_manager.set_stop_reason("max_tokens");
+            // [fork 定制] 上游给了停止原因时以上游为准（例如 END_TURN 就是正常结束），
+            // 只有收不到 metadataEvent 时才按"预算耗在思考上"推测为 max_tokens
+            if self.upstream_stats.stop_reason.is_none() {
+                self.state_manager.set_stop_reason("max_tokens");
+            }
             events.extend(self.create_text_delta_events(" "));
         }
 
@@ -1421,15 +1452,15 @@ mod tests {
         }));
         ctx.process_kiro_event(&Event::Metering(MeteringEvent { usage: Some(0.25) }));
         ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            stop_reason: Some("CONTENT_FILTERED".to_string()),
+            stop_reason: Some("END_TURN".to_string()),
             ..Default::default()
         }));
         assert_eq!(ctx.upstream_stats().reasoning_chars, 3);
         assert_eq!(
             ctx.upstream_stats().stop_reason.as_deref(),
-            Some("CONTENT_FILTERED")
+            Some("END_TURN")
         );
-        // 统计类事件不产生客户端可见输出，行为与之前一致：仍会透明重试
+        // 只有推理、正常结束：客户端看不到任何内容，仍会透明重试
         assert!(ctx.should_retry_empty_output());
 
         ctx.reset_for_upstream_retry();
@@ -1439,6 +1470,70 @@ mod tests {
         assert_eq!(stats.reasoning_events, 1);
         assert_eq!(stats.empty_retries, 1);
         assert!(stats.stop_reason.is_none());
+    }
+
+    fn metadata(stop_reason: &str) -> Event {
+        Event::Metadata(MetadataEvent {
+            stop_reason: Some(stop_reason.to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn final_stop_reason(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event")
+            .data["delta"]["stop_reason"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn test_upstream_max_tokens_is_reported_to_client() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 10, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("1 2 3 4");
+        let _ = ctx.process_kiro_event(&metadata("MAX_TOKENS"));
+        let events = ctx.generate_final_events();
+        assert_eq!(final_stop_reason(&events), "max_tokens");
+    }
+
+    #[test]
+    fn test_content_filtered_is_terminal_refusal() {
+        use crate::kiro::model::events::{ContextUsageEvent, ReasoningContentEvent};
+
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 10, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "thinking".to_string(),
+        }));
+        let _ = ctx.process_kiro_event(&metadata("CONTENT_FILTERED"));
+        // 紧跟的上下文占满不能把拒答改成上下文溢出（否则 Claude Code 会压缩后重发）
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 100.0,
+        }));
+        // 拒答不是空输出，透明重试也不会改变结果
+        assert!(!ctx.should_retry_empty_output());
+        assert_eq!(final_stop_reason(&ctx.generate_final_events()), "refusal");
+    }
+
+    #[test]
+    fn test_thinking_only_with_upstream_end_turn_is_not_max_tokens() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("<thinking>\nabc</thinking>");
+        let _ = ctx.process_kiro_event(&metadata("END_TURN"));
+        assert_eq!(final_stop_reason(&ctx.generate_final_events()), "end_turn");
+    }
+
+    #[test]
+    fn test_upstream_end_turn_with_empty_output_still_retries() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 10, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&metadata("END_TURN"));
+        assert!(ctx.should_retry_empty_output());
     }
 
     #[test]
